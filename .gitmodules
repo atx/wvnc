@@ -1,0 +1,6 @@
+[submodule "wlr-protocols"]
+	path = wlr-protocols
+	url = https://github.com/swaywm/wlr-protocols.git
+[submodule "wayland-protocols"]
+	path = wayland-protocols
+	url = https://github.com/wayland-project/wayland-protocols.git
