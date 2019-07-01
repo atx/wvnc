@@ -139,11 +139,6 @@ static void handle_output_mode(void *data, struct wl_output *wl,
 							   uint32_t flags, int32_t width, int32_t height,
 							   int32_t refresh)
 {
-	struct wvnc_output *output = data;
-	if (flags & WL_OUTPUT_MODE_CURRENT) {
-		output->width = width;
-		output->height = height;
-	}
 }
 
 
@@ -227,6 +222,11 @@ static void handle_xdg_output_logical_size(void *data,
 										   struct zxdg_output_v1 *xdg,
 										   int32_t width, int32_t height)
 {
+	struct wvnc_output *output = data;
+	// Note that this is _logical size_
+	// That is, it includes rotations and scalings
+	output->width = width;
+	output->height = height;
 }
 
 
@@ -354,10 +354,48 @@ static void init_rfb(struct wvnc *wvnc)
 }
 
 
+rgba_t *get_transformed_fb_ptr(rgba_t *fb, enum wl_output_transform transform,
+							   uint32_t width, uint32_t height,
+							   uint32_t ox, uint32_t oy)
+{
+	// TODO: This will not get inlined/vectorized well. We should
+	// build multiple versions of copy_to_next_fb with different transforms
+	// baked in
+	uint32_t tx, ty;
+	// TODO: This assumes we have y_flipped!
+	// This should be corrected globally be changing the flag after we get the
+	// first buffer back.
+	switch (transform) {
+	case WL_OUTPUT_TRANSFORM_NORMAL:
+		tx = ox;
+		ty = height - oy - 1;
+		break;
+	case WL_OUTPUT_TRANSFORM_90:
+		tx = width - oy - 1;
+		ty = height - ox - 1;
+		break;
+	case WL_OUTPUT_TRANSFORM_180:
+		tx = ox;
+		ty = oy;
+		break;
+	case WL_OUTPUT_TRANSFORM_270:
+		tx = oy;
+		ty = ox;
+		break;
+	default:
+		assert(false);
+		// Meh, this will break but whatever
+		tx = ox;
+		ty = oy;
+	};
+
+	return &fb[ty * width + tx];
+}
+
+
 static void copy_to_next_fb(struct wvnc *wvnc, struct wvnc_buffer *buffer)
 {
 	// TODO: Support different formats
-	// TODO: Support transforms
 	for (uint32_t y = 0; y < buffer->height; y++) {
 		for (uint32_t x = 0; x < buffer->width; x++) {
 			assert(buffer->format == WL_SHM_FORMAT_ARGB8888);
@@ -368,7 +406,11 @@ static void copy_to_next_fb(struct wvnc *wvnc, struct wvnc_buffer *buffer)
 				.b = (src >>  0) & 0xff,
 				.a = 0xff,
 			};
-			rgba_t *tgt = &wvnc->rfb.fb_next[y*wvnc->selected_output->width + x];
+			rgba_t *tgt = get_transformed_fb_ptr(
+				wvnc->rfb.fb_next, wvnc->selected_output->transform,
+				wvnc->selected_output->width, wvnc->selected_output->height,
+				x, y
+			);
 			*tgt = c;
 		}
 	}
@@ -456,8 +498,6 @@ int main(int argc, const char *argv[])
 			wl_display_flush(wvnc->wl.display);
 		} else if (capturing && buffer->done) {
 			capturing = false;
-			assert(wvnc->selected_output->width == buffer->width &&
-				   wvnc->selected_output->height == buffer->height);
 
 			copy_to_next_fb(wvnc, buffer);
 			update_framebuffer(wvnc);
