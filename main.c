@@ -399,7 +399,7 @@ static void update_framebuffer(struct wvnc *wvnc)
 
 	for (uint32_t y = 0; y < wvnc->selected_output->height; y++) {
 		uint64_t bits = scanline_damage_map[y / 64];
-		if (bits & (1 << (y & 64))) {
+		if (bits & (1 << (y % 64))) {
 			rfbMarkRectAsModified(
 					wvnc->rfb.screen_info,
 					0, y, wvnc->selected_output->width, y + 1
