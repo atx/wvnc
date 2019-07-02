@@ -612,7 +612,11 @@ int main(int argc, char *argv[])
 			}
 		}
 	} else {
-		wl_list_for_each(wvnc->selected_output, &wvnc->outputs, link);
+		struct wvnc_output *out;
+		wl_list_for_each(out, &wvnc->outputs, link) {
+			wvnc->selected_output = out;
+			break;
+		}
 	}
 	if (wvnc->selected_output == NULL) {
 		fail("No output found");
