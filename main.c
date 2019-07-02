@@ -20,6 +20,7 @@
 #include "wayland-xdg-output-client-protocol.h"
 
 #include "keymap.h"
+#include "uinput.h"
 #include "utils.h"
 
 
@@ -57,6 +58,7 @@ struct wvnc_args {
 	in_addr_t address;
 	int port;
 	int period;
+	bool no_uinput;
 };
 
 
@@ -79,6 +81,8 @@ struct wvnc {
 
 	struct wvnc_args args;
 
+	struct wvnc_uinput uinput;
+
 	struct keymap keymap;
 	unsigned int mod_counters[KEYMAP_MOD_MAX + 1];
 
@@ -86,6 +90,9 @@ struct wvnc {
 
 	struct wl_list outputs;
 	struct wvnc_output *selected_output;
+
+	uint32_t logical_width;
+	uint32_t logical_height;
 };
 
 
@@ -94,6 +101,8 @@ struct wvnc_output {
 	struct zxdg_output_v1 *xdg;
 	struct wl_list link;
 
+	int32_t x;
+	int32_t y;
 	uint32_t width;
 	uint32_t height;
 	enum wl_output_transform transform;
@@ -233,6 +242,9 @@ static void handle_xdg_output_logical_position(void *data,
 											   struct zxdg_output_v1 *xdg,
 											   int32_t x, int32_t y)
 {
+	struct wvnc_output *output = data;
+	output->x = x;
+	output->y = y;
 }
 
 
@@ -377,13 +389,40 @@ static enum rfbNewClientAction rfb_new_client_hook(rfbClientPtr cl)
 }
 
 
+static void rfb_ptr_hook(int mask, int screen_x, int screen_y, rfbClientPtr cl)
+{
+	struct wvnc *wvnc = cl->clientData;
+	if (!wvnc->uinput.initialized) {
+		return; // Nothing to do here
+	}
+	// Way too lazy to debug fixpoing scaling
+	float global_x = (float)wvnc->selected_output->x + screen_x;
+	float global_y = (float)wvnc->selected_output->y + screen_y;
+	float touch_x = global_x / wvnc->logical_width * UINPUT_ABS_MAX;
+	float touch_y = global_y / wvnc->logical_height * UINPUT_ABS_MAX;
+
+	uinput_move_abs(&wvnc->uinput, (int32_t)touch_x, (int32_t)touch_y);
+
+	uinput_set_buttons(
+		&wvnc->uinput,
+		!!(mask & BIT(0)), !!(mask & BIT(1)), !!(mask & BIT(2))
+	);
+
+	if (mask & BIT(4)) {
+		uinput_wheel(&wvnc->uinput, false);
+	}
+	if (mask & BIT(3)) {
+		uinput_wheel(&wvnc->uinput, true);
+	}
+}
+
+
 static void rfb_key_hook(rfbBool down, rfbKeySym keysym, rfbClientPtr cl)
 {
 	struct wvnc *wvnc = cl->clientData;
 	if (wvnc->wl.keyboard == NULL) {
 		return;
 	}
-	// TODO: Handle modifiers
 
 	enum keymap_push_result result = keymap_push_keysym(&wvnc->keymap, keysym);
 	if (result == KEYMAP_PUSH_NOT_FOUND) {
@@ -486,6 +525,26 @@ static void update_framebuffer(struct wvnc *wvnc)
 }
 
 
+static void calculate_logical_size(struct wvnc *wvnc)
+{
+	int32_t min_x = INT32_MAX;
+	int32_t max_x = INT32_MIN;
+	int32_t min_y = INT32_MAX;
+	int32_t max_y = INT32_MIN;
+	struct wvnc_output *output;
+	wl_list_for_each(output, &wvnc->outputs, link) {
+		log_info(output->name);
+		min_x = min(min_x, output->x);
+		max_x = max(max_x, output->x + (int32_t)output->width);
+		min_y = min(min_y, output->y);
+		max_y = max(max_y, output->y + (int32_t)output->height);
+	}
+	wvnc->logical_width = max_x - min_x;
+	wvnc->logical_height = max_y - min_y;
+	log_info("Boundaries %dx%d %dx%d", min_x, min_y, max_x, max_y);
+}
+
+
 static void init_virtual_keyboard(struct wvnc *wvnc)
 {
 	if (wvnc->wl.keyboard_manager == NULL || wvnc->wl.seat == NULL) {
@@ -529,6 +588,7 @@ static void init_wayland(struct wvnc *wvnc)
 	wl_display_dispatch(wvnc->wl.display);
 	wl_display_roundtrip(wvnc->wl.display);
 	init_virtual_keyboard(wvnc);
+	calculate_logical_size(wvnc);
 	log_info("Wayland initialized with %d outputs", wl_list_length(&wvnc->outputs));
 }
 
@@ -576,6 +636,7 @@ static struct argp_option argp_options[] = {
 	{ "bind", 'b', "ADDRESS", 0, "Select bind address", 0 },
 	{ "port", 'p', "PORT", 0, "Select port", 0 },
 	{ "period", 't', "PERIOD", 0, "Sampling period in ms", 0 },
+	{ "no-uinput", 'U', NULL, 0, "Disable uinput tablet", 0 },
 	{ NULL, 0, NULL, 0, NULL, 0 }
 };
 
@@ -605,6 +666,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 			argp_failure(state, EXIT_FAILURE, 0, "Invalid period");
 		}
 		break;
+	case 'U':
+		args->no_uinput = true;
+		break;
 	default:
 		return ARGP_ERR_UNKNOWN;
 	}
@@ -623,6 +687,15 @@ int main(int argc, char *argv[])
 	struct argp argp = { argp_options, parse_opt, NULL, NULL, NULL, NULL, NULL };
 	argp_parse(&argp, argc, argv, 0, NULL, &wvnc->args);
 
+	// Initialize uinput
+	// For some reason, we absolutely have to initialize this
+	// before initializing wayland
+	if (!wvnc->args.no_uinput) {
+		int ret = uinput_init(&wvnc->uinput);
+		if (ret) {
+			log_error("Failed to initialize uinput: %s", strerror(errno));
+		}
+	}
 	init_wayland(wvnc);
 
 	if (wl_list_length(&wvnc->outputs) > 1) {
