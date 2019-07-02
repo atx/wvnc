@@ -759,7 +759,7 @@ int main(int argc, char *argv[])
 		// TODO: Maybe use epoll or something
 		struct timeval timeout = {
 			.tv_sec = 0,
-			.tv_usec = capture_period
+			.tv_usec = t_delta < capture_period ? (capture_period - t_delta) : 0
 		};
 		int wl_fd = wl_display_get_fd(wvnc->wl.display);
 		fd_set fds;
