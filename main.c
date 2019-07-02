@@ -603,7 +603,6 @@ static void init_rfb(struct wvnc *wvnc)
 		wvnc->selected_output->width, wvnc->selected_output->height,
 		8, 3, 4
 	);
-	// TODO: Command line arguments here
 	wvnc->rfb.screen_info->desktopName = "wvnc";
 	wvnc->rfb.screen_info->alwaysShared = true;
 	wvnc->rfb.screen_info->port = wvnc->args.port;
@@ -615,7 +614,8 @@ static void init_rfb(struct wvnc *wvnc)
 	wvnc->rfb.screen_info->newClientHook = rfb_new_client_hook;
 	wvnc->rfb.screen_info->kbdAddEvent = rfb_key_hook;
 	wvnc->rfb.screen_info->ptrAddEvent = rfb_ptr_hook;
-	// TODO: Set rfbLog/rfbErr
+	rfbLog = log_info;
+	rfbErr = log_error;
 
 	size_t fb_size = wvnc->selected_output->width * wvnc->selected_output->height * sizeof(rgba_t);
 	wvnc->rfb.fb = xmalloc(fb_size);
