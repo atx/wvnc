@@ -1,5 +1,7 @@
 
 #include <assert.h>
+#include <arpa/inet.h>
+#include <argp.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -49,6 +51,14 @@ struct wvnc_buffer {
 };
 
 
+struct wvnc_args {
+	const char *output;
+	in_addr_t address;
+	int port;
+	int period;
+};
+
+
 struct wvnc {
 	struct {
 		rfbScreenInfo *screen_info;
@@ -65,6 +75,8 @@ struct wvnc {
 		struct zwp_virtual_keyboard_manager_v1 *keyboard_manager;
 		struct zwp_virtual_keyboard_v1 *keyboard;
 	} wl;
+
+	struct wvnc_args args;
 
 	struct keymap keymap;
 
@@ -531,7 +543,11 @@ static void init_rfb(struct wvnc *wvnc)
 	// TODO: Command line arguments here
 	wvnc->rfb.screen_info->desktopName = "wvnc";
 	wvnc->rfb.screen_info->alwaysShared = true;
-	wvnc->rfb.screen_info->port = 5100;
+	wvnc->rfb.screen_info->port = wvnc->args.port;
+	wvnc->rfb.screen_info->listenInterface = wvnc->args.address;
+	// TODO: Maybe enable IPv6 someday
+	wvnc->rfb.screen_info->ipv6port = 0;
+	wvnc->rfb.screen_info->listen6Interface = NULL;
 	wvnc->rfb.screen_info->screenData = wvnc;
 	wvnc->rfb.screen_info->newClientHook = rfb_new_client_hook;
 	wvnc->rfb.screen_info->kbdAddEvent = rfb_key_hook;
@@ -547,23 +563,80 @@ static void init_rfb(struct wvnc *wvnc)
 }
 
 
-int main(int argc, const char *argv[])
+const char *argp_program_version = "wvnc 0.0";
+const char *argp_program_bug_address = "<atx@atx.name>";
+
+
+static struct argp_option argp_options[] = {
+	{ "output", 'o', "OUTPUT", 0, "Select output", 0 },
+	{ "bind", 'b', "ADDRESS", 0, "Select bind address", 0 },
+	{ "port", 'p', "PORT", 0, "Select port", 0 },
+	{ "period", 't', "PERIOD", 0, "Sampling period in ms", 0 },
+	{ NULL, 0, NULL, 0, NULL, 0 }
+};
+
+
+static error_t parse_opt(int key, char *arg, struct argp_state *state)
+{
+	struct wvnc_args *args = state->input;
+	switch(key) {
+	case 'o':
+		args->output = arg;
+		break;
+	case 'b':
+		args->address = inet_addr(arg);
+		if (args->address == INADDR_NONE) {
+			argp_failure(state, EXIT_FAILURE, 0, "Invalid bind address");
+		}
+		break;
+	case 'p':
+		args->port = atoi(arg);
+		if (args->port <= 0) {
+			argp_failure(state, EXIT_FAILURE, 0, "Invalid port");
+		}
+		break;
+	case 't':
+		args->period = atoi(arg);
+		if (args->period <= 0) {
+			argp_failure(state, EXIT_FAILURE, 0, "Invalid period");
+		}
+		break;
+	default:
+		return ARGP_ERR_UNKNOWN;
+	}
+	return 0;
+}
+
+
+int main(int argc, char *argv[])
 {
 	struct wvnc *wvnc = xmalloc(sizeof(struct wvnc));
 	global_wvnc = wvnc;
+	wvnc->args.port = 5100;
+	wvnc->args.address = inet_addr("127.0.0.1");
+	wvnc->args.period = 30;  // 30 FPS-ish
+
+	struct argp argp = { argp_options, parse_opt, NULL, NULL, NULL, NULL, NULL };
+	argp_parse(&argp, argc, argv, 0, NULL, &wvnc->args);
 
 	init_wayland(wvnc);
 
-	const char *output_name = "DP-1";
-	struct wvnc_output *out;
-	wl_list_for_each(out, &wvnc->outputs, link) {
-		if (!strcmp(out->name, output_name)) {
-			wvnc->selected_output = out;
-			break;
+	if (wl_list_length(&wvnc->outputs) > 1) {
+		if (wvnc->args.output == NULL) {
+			fail("Multiple outputs specified but none explicitly selected");
 		}
+		struct wvnc_output *out;
+		wl_list_for_each(out, &wvnc->outputs, link) {
+			if (!strcmp(out->name, wvnc->args.output)) {
+				wvnc->selected_output = out;
+				break;
+			}
+		}
+	} else {
+		wl_list_for_each(wvnc->selected_output, &wvnc->outputs, link);
 	}
 	if (wvnc->selected_output == NULL) {
-		fail("Output %s not found", output_name);
+		fail("No output found");
 	}
 	// TODO: Handle size and transformations
 	log_info("Starting on output %s with resolution %dx%d",
@@ -575,7 +648,7 @@ int main(int argc, const char *argv[])
 
 	// Start capture
 	uint64_t last_capture = 0; // Start of last capture
-	const uint64_t capture_period = 16 * 1000;  // 30 FPS-ish
+	const uint64_t capture_period = wvnc->args.period * 1000;
 	struct zwlr_screencopy_frame_v1 *frame = NULL;
 	bool capturing = false;
 	while (true) {
