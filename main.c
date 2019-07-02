@@ -1,5 +1,6 @@
 
 #include <assert.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -7,12 +8,15 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <threads.h>
 
 #include <rfb/rfb.h>
 
 #include "wayland-xdg-output-client-protocol.h"
 #include "wayland-wlr-screencopy-client-protocol.h"
+#include "wayland-virtual-keyboard-client-protocol.h"
 
+#include "keymap.h"
 #include "utils.h"
 
 
@@ -55,9 +59,14 @@ struct wvnc {
 		struct wl_display *display;
 		struct wl_registry *registry;
 		struct wl_shm *shm;
+		struct wl_seat *seat;
 		struct zxdg_output_manager_v1 *output_manager;
 		struct zwlr_screencopy_manager_v1 *screencopy_manager;
+		struct zwp_virtual_keyboard_manager_v1 *keyboard_manager;
+		struct zwp_virtual_keyboard_v1 *keyboard;
 	} wl;
+
+	struct keymap keymap;
 
 	struct wvnc_buffer buffers[16];
 
@@ -79,22 +88,38 @@ struct wvnc_output {
 };
 
 
-static void initialize_shm_buffer(struct wvnc_buffer *buffer,
-								  enum wl_shm_format format,
-								  uint32_t width, uint32_t height,
-								  uint32_t stride)
+// This is because we can't pass our global pointer into some of the 
+// rfb callbacks. Use minimally.
+thread_local struct wvnc *global_wvnc;
+
+
+static int open_shm_fd()
 {
 	const char *filename_format = "/wvnc-%d";
 	char filename[sizeof(filename_format) + 10];
 	int fd = -1;
-	for (int i = 0; i < 1000; i++) {
+	for (int i = 0; i < 10000; i++) {
 		snprintf(filename, sizeof(filename), filename_format, i);
 		fd = shm_open(filename, O_RDWR | O_EXCL | O_CREAT | O_TRUNC, 0660);
 		if (fd >= 0) {
 			// Just the fd matters now
 			shm_unlink(filename);
+			break;
 		}
 	}
+	if (fd < 0) {
+		fail("Failed to open SHM file");
+	}
+	return fd;
+}
+
+
+static void initialize_shm_buffer(struct wvnc_buffer *buffer,
+								  enum wl_shm_format format,
+								  uint32_t width, uint32_t height,
+								  uint32_t stride)
+{
+	int fd = open_shm_fd();
 	size_t size = stride * height;
 	int ret = ftruncate(fd, size);
 	if (ret < 0) {
@@ -262,23 +287,28 @@ static void handle_wl_registry_global(void *data, struct wl_registry *registry,
 									  uint32_t name, const char *interface,
 									  uint32_t version)
 {
+#define IS_PROTOCOL(x) !strcmp(interface, x##_interface.name)
+#define BIND(x, ver) wl_registry_bind(registry, name, &x##_interface, min((uint32_t)ver, version))
 	struct wvnc *wvnc = data;
-	if (!strcmp(interface, wl_output_interface.name)) {
+	if (IS_PROTOCOL(wl_output)) {
 		struct wvnc_output *out = xmalloc(sizeof(struct wvnc_output));
-		out->wl = wl_registry_bind(registry, name, &wl_output_interface, 1);
+		out->wl = BIND(wl_output, 1);
 		wl_output_add_listener(out->wl, &output_listener, out);
 		wl_list_insert(&wvnc->outputs, &out->link);
-	} else if (!strcmp(interface, zxdg_output_manager_v1_interface.name)) {
+	} else if (IS_PROTOCOL(zxdg_output_manager_v1)) {
 		// TODO: Load names
-		wvnc->wl.output_manager = wl_registry_bind(
-			registry, name, &zxdg_output_manager_v1_interface, min(version, 2u)
-		);
-	} else if (!strcmp(interface, zwlr_screencopy_manager_v1_interface.name)) {
-		wvnc->wl.screencopy_manager = wl_registry_bind(registry, name,
-				&zwlr_screencopy_manager_v1_interface, 1);
-	} else if (!strcmp(interface, wl_shm_interface.name)) {
-		wvnc->wl.shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
+		wvnc->wl.output_manager = BIND(zxdg_output_manager_v1, 2);
+	} else if (IS_PROTOCOL(zwlr_screencopy_manager_v1)) {
+		wvnc->wl.screencopy_manager = BIND(zwlr_screencopy_manager_v1, 1);
+	} else if (IS_PROTOCOL(wl_shm)) {
+		wvnc->wl.shm = BIND(wl_shm, 1);
+	} else if (IS_PROTOCOL(wl_seat)) {
+		wvnc->wl.seat = BIND(wl_seat, 7);
+	} else if (IS_PROTOCOL(zwp_virtual_keyboard_manager_v1)) {
+		wvnc->wl.keyboard_manager = BIND(zwp_virtual_keyboard_manager_v1, 1);
 	}
+#undef BIND
+#undef IS_PROTOCOL
 }
 
 
@@ -293,65 +323,6 @@ static const struct wl_registry_listener registry_listener = {
 	.global = handle_wl_registry_global,
 	.global_remove = handle_wl_registry_global_remove,
 };
-
-
-static void init_wayland(struct wvnc *wvnc)
-{
-	wvnc->wl.display = wl_display_connect(NULL);
-	if (wvnc->wl.display == NULL) {
-		fail("Failed to connect to the Wayland display");
-	}
-	wl_list_init(&wvnc->outputs);
-	for (size_t i = 0; i < ARRAY_SIZE(wvnc->buffers); i++) {
-		wvnc->buffers[i].wvnc = wvnc;
-	}
-	wvnc->wl.registry = wl_display_get_registry(wvnc->wl.display);
-	wl_registry_add_listener(wvnc->wl.registry, &registry_listener, wvnc);
-	wl_display_dispatch(wvnc->wl.display);
-	wl_display_roundtrip(wvnc->wl.display);
-	if (wvnc->wl.screencopy_manager == NULL) {
-		fail("wlr-screencopy protocol not supported!");
-	}
-	if (wvnc->wl.output_manager == NULL) {
-		fail("xdg-output-manager protocol not supported");
-	}
-	struct wvnc_output *output;
-	wl_list_for_each(output, &wvnc->outputs, link) {
-		output->xdg = zxdg_output_manager_v1_get_xdg_output(
-			wvnc->wl.output_manager, output->wl
-		);
-		zxdg_output_v1_add_listener(output->xdg, &xdg_output_listener, output);
-	}
-	wl_display_dispatch(wvnc->wl.display);
-	wl_display_roundtrip(wvnc->wl.display);
-	log_info("Wayland initialized with %d outputs", wl_list_length(&wvnc->outputs));
-}
-
-
-static void init_rfb(struct wvnc *wvnc)
-{
-	log_info("Initializing RFB");
-	// 4 bytes per pixel only at the moment. Probably not worth using anything
-	// else.
-	wvnc->rfb.screen_info = rfbGetScreen(
-		NULL, NULL,
-		wvnc->selected_output->width, wvnc->selected_output->height,
-		8, 3, 4
-	);
-	// TODO: Command line arguments here
-	wvnc->rfb.screen_info->desktopName = "wvnc";
-	wvnc->rfb.screen_info->alwaysShared = true;
-	wvnc->rfb.screen_info->port = 5100;
-	// TODO: Set rfbLog/rfbErr
-
-	size_t fb_size = wvnc->selected_output->width * wvnc->selected_output->height * sizeof(rgba_t);
-	wvnc->rfb.fb = xmalloc(fb_size);
-	wvnc->rfb.fb_next = xmalloc(fb_size);
-	wvnc->rfb.screen_info->frameBuffer = (char *)wvnc->rfb.fb;
-
-	log_info("Starting the VNC server");
-	rfbInitServer(wvnc->rfb.screen_info);
-}
 
 
 rgba_t *get_transformed_fb_ptr(rgba_t *fb, enum wl_output_transform transform,
@@ -393,12 +364,59 @@ rgba_t *get_transformed_fb_ptr(rgba_t *fb, enum wl_output_transform transform,
 }
 
 
+static void update_virtual_keyboard(struct wvnc *wvnc)
+{
+	int fd = open_shm_fd();
+	FILE *f = fdopen(fd, "w");
+	keymap_print_to_file(&wvnc->keymap, f);
+	size_t size = ftell(f);
+
+	zwp_virtual_keyboard_v1_keymap(wvnc->wl.keyboard, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd, size);
+	wl_display_dispatch_pending(wvnc->wl.display);
+	fclose(f);
+}
+
+
+static enum rfbNewClientAction rfb_new_client_hook(rfbClientPtr cl)
+{
+	cl->clientData = global_wvnc;
+	return RFB_CLIENT_ACCEPT;
+}
+
+
+static void rfb_key_hook(rfbBool down, rfbKeySym keysym, rfbClientPtr cl)
+{
+	struct wvnc *wvnc = cl->clientData;
+	if (wvnc->wl.keyboard == NULL) {
+		return;
+	}
+	// TODO: Handle modifiers
+
+	enum keymap_push_result result = keymap_push_keysym(&wvnc->keymap, keysym);
+	if (result == KEYMAP_PUSH_NOT_FOUND) {
+		log_error("Unknown keysym %04x", keysym);
+		return;
+	}
+
+	if (result == KEYMAP_PUSH_ADDED) {
+		log_info("Updating virtual keymap");
+		update_virtual_keyboard(wvnc);
+	}
+
+	zwp_virtual_keyboard_v1_key(
+		wvnc->wl.keyboard, 0, wvnc->keymap.map[keysym].keycode,
+		down ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED
+	);
+	wl_display_dispatch_pending(wvnc->wl.display);
+}
+
+
 static void copy_to_next_fb(struct wvnc *wvnc, struct wvnc_buffer *buffer)
 {
 	// TODO: Support different formats
+	assert(buffer->format == WL_SHM_FORMAT_ARGB8888 || buffer->format == WL_SHM_FORMAT_XRGB8888);
 	for (uint32_t y = 0; y < buffer->height; y++) {
 		for (uint32_t x = 0; x < buffer->width; x++) {
-			assert(buffer->format == WL_SHM_FORMAT_ARGB8888);
 			uint32_t src = *(uint32_t *)(buffer->data + y * buffer->stride + x * 4);
 			rgba_t c = {
 				.r = (src >> 16) & 0xff,
@@ -451,9 +469,88 @@ static void update_framebuffer(struct wvnc *wvnc)
 }
 
 
+static void init_virtual_keyboard(struct wvnc *wvnc)
+{
+	if (wvnc->wl.keyboard_manager == NULL || wvnc->wl.seat == NULL) {
+		log_error("Unable to create a virtual keyboard");
+		return;
+	}
+	wvnc->wl.keyboard = zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(
+		wvnc->wl.keyboard_manager, wvnc->wl.seat
+	);
+
+	keymap_init(&wvnc->keymap);
+	update_virtual_keyboard(wvnc);
+}
+
+
+static void init_wayland(struct wvnc *wvnc)
+{
+	wvnc->wl.display = wl_display_connect(NULL);
+	if (wvnc->wl.display == NULL) {
+		fail("Failed to connect to the Wayland display");
+	}
+	wl_list_init(&wvnc->outputs);
+	for (size_t i = 0; i < ARRAY_SIZE(wvnc->buffers); i++) {
+		wvnc->buffers[i].wvnc = wvnc;
+	}
+	wvnc->wl.registry = wl_display_get_registry(wvnc->wl.display);
+	wl_registry_add_listener(wvnc->wl.registry, &registry_listener, wvnc);
+	wl_display_dispatch(wvnc->wl.display);
+	wl_display_roundtrip(wvnc->wl.display);
+	if (wvnc->wl.screencopy_manager == NULL) {
+		fail("wlr-screencopy protocol not supported!");
+	}
+	if (wvnc->wl.output_manager == NULL) {
+		fail("xdg-output-manager protocol not supported");
+	}
+	struct wvnc_output *output;
+	wl_list_for_each(output, &wvnc->outputs, link) {
+		output->xdg = zxdg_output_manager_v1_get_xdg_output(
+			wvnc->wl.output_manager, output->wl
+		);
+		zxdg_output_v1_add_listener(output->xdg, &xdg_output_listener, output);
+	}
+	wl_display_dispatch(wvnc->wl.display);
+	wl_display_roundtrip(wvnc->wl.display);
+	init_virtual_keyboard(wvnc);
+	log_info("Wayland initialized with %d outputs", wl_list_length(&wvnc->outputs));
+}
+
+
+static void init_rfb(struct wvnc *wvnc)
+{
+	log_info("Initializing RFB");
+	// 4 bytes per pixel only at the moment. Probably not worth using anything
+	// else.
+	wvnc->rfb.screen_info = rfbGetScreen(
+		NULL, NULL,
+		wvnc->selected_output->width, wvnc->selected_output->height,
+		8, 3, 4
+	);
+	// TODO: Command line arguments here
+	wvnc->rfb.screen_info->desktopName = "wvnc";
+	wvnc->rfb.screen_info->alwaysShared = true;
+	wvnc->rfb.screen_info->port = 5100;
+	wvnc->rfb.screen_info->screenData = wvnc;
+	wvnc->rfb.screen_info->newClientHook = rfb_new_client_hook;
+	wvnc->rfb.screen_info->kbdAddEvent = rfb_key_hook;
+	// TODO: Set rfbLog/rfbErr
+
+	size_t fb_size = wvnc->selected_output->width * wvnc->selected_output->height * sizeof(rgba_t);
+	wvnc->rfb.fb = xmalloc(fb_size);
+	wvnc->rfb.fb_next = xmalloc(fb_size);
+	wvnc->rfb.screen_info->frameBuffer = (char *)wvnc->rfb.fb;
+
+	log_info("Starting the VNC server");
+	rfbInitServer(wvnc->rfb.screen_info);
+}
+
+
 int main(int argc, const char *argv[])
 {
 	struct wvnc *wvnc = xmalloc(sizeof(struct wvnc));
+	global_wvnc = wvnc;
 
 	init_wayland(wvnc);
 
