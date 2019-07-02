@@ -45,7 +45,7 @@ include_directories (${XKBCOMMON_INCLUDEDIR})
 
 add_executable (wvnc main.c utils.c keymap.c uinput.c ${VIRTUAL_KEYBOARD_SRC}
 	${WLR_SCREENCOPY_SRC} ${XDG_OUTPUT_SRC})
-target_link_libraries (wvnc rt ${Wayland_LIBRARIES} ${LIBVNCSERVER_LIBRARIES}
+target_link_libraries (wvnc rt m ${Wayland_LIBRARIES} ${LIBVNCSERVER_LIBRARIES}
 	${XKBCOMMON_LIBRARIES})
 
 install (TARGETS wvnc RUNTIME DESTINATION bin COMPONENT bin)

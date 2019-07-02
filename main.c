@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -396,10 +397,12 @@ static void rfb_ptr_hook(int mask, int screen_x, int screen_y, rfbClientPtr cl)
 		return; // Nothing to do here
 	}
 	// Way too lazy to debug fixpoing scaling
-	float global_x = (float)wvnc->selected_output->x + screen_x;
-	float global_y = (float)wvnc->selected_output->y + screen_y;
-	float touch_x = global_x / wvnc->logical_width * UINPUT_ABS_MAX;
-	float touch_y = global_y / wvnc->logical_height * UINPUT_ABS_MAX;
+	float global_x = (float)wvnc->selected_output->x +
+		clamp(screen_x, 0, (int)wvnc->selected_output->width);
+	float global_y = (float)wvnc->selected_output->y +
+		clamp(screen_y, 0, (int)wvnc->selected_output->height);
+	int32_t touch_x = round(global_x / wvnc->logical_width * UINPUT_ABS_MAX);
+	int32_t touch_y = round(global_y / wvnc->logical_height * UINPUT_ABS_MAX);
 
 	uinput_move_abs(&wvnc->uinput, (int32_t)touch_x, (int32_t)touch_y);
 

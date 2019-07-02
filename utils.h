@@ -28,5 +28,7 @@ int shm_create();
        __typeof__ (b) _b = (b); \
        _a < _b ? _a : _b; })
 
+#define clamp(x, a, b) min(max(x, a), b)
+
 
 #define BIT(n) (1 << (n))
