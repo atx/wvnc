@@ -1,7 +1,10 @@
 
+#include <assert.h>
 #include <string.h>
 
 #include <xkbcommon/xkbcommon.h>
+
+#include "utils.h"
 
 #include "keymap.h"
 
@@ -70,4 +73,41 @@ void keymap_print_to_file(struct keymap *keymap, FILE *f)
 	fprintf(f, "};\n");
 	fputc('\0', f);
 	fflush(f);
+}
+
+
+uint32_t keymap_get_keycode(struct keymap *keymap, uint32_t keysym)
+{
+	assert(keysym <= KEYMAP_MAX_KEYSYM);
+	return keymap->map[keysym].keycode;
+}
+
+
+static struct {
+	const char *name; enum keymap_mod mod;
+} mod_map[] = {
+	{ "Shift_L", KEYMAP_MOD_SHIFT },
+	{ "Shift_R", KEYMAP_MOD_SHIFT },
+	{ "Control_L", KEYMAP_MOD_CTRL },
+	{ "Control_R", KEYMAP_MOD_CTRL },
+	{ "Super_L", KEYMAP_MOD_SUPER },
+	{ "Super_R", KEYMAP_MOD_SUPER },
+	{ "ISO_Level3_Shift", KEYMAP_MOD_ALTGR },
+	{ "Caps Lock", KEYMAP_MOD_CAPSLOCK },
+};
+
+
+enum keymap_mod keymap_get_modifier(struct keymap *keymap, uint32_t keysym)
+{
+	if (keysym > KEYMAP_MAX_KEYSYM || keymap->map[keysym].name == NULL) {
+		return KEYMAP_MOD_NONE;
+	}
+
+	for (size_t i = 0; i < ARRAY_SIZE(mod_map); i++) {
+		if (!strcmp(keymap->map[keysym].name, mod_map[i].name)) {
+			return mod_map[i].mod;
+		}
+	}
+
+	return KEYMAP_MOD_NONE;
 }

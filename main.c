@@ -80,6 +80,7 @@ struct wvnc {
 	struct wvnc_args args;
 
 	struct keymap keymap;
+	unsigned int mod_counters[KEYMAP_MOD_MAX + 1];
 
 	struct wvnc_buffer buffer;
 
@@ -395,8 +396,32 @@ static void rfb_key_hook(rfbBool down, rfbKeySym keysym, rfbClientPtr cl)
 		update_virtual_keyboard(wvnc);
 	}
 
+	enum keymap_mod mod = keymap_get_modifier(&wvnc->keymap, keysym);
+	if (mod != KEYMAP_MOD_NONE) {
+		if (down) {
+			wvnc->mod_counters[mod]++;
+		} else if (wvnc->mod_counters[mod] > 0){
+			wvnc->mod_counters[mod]--;
+		} else {
+			log_error("Modifier %d released without being pressed first!", mod);
+		}
+
+		uint32_t mods = 0;
+		for (size_t i = 0; i < ARRAY_SIZE(wvnc->mod_counters); i++) {
+			if (wvnc->mod_counters[i] > 0) {
+				mods |= BIT(i);
+			}
+		}
+
+		log_info("Sending mod mask %02x", mods);
+
+		zwp_virtual_keyboard_v1_modifiers(
+			wvnc->wl.keyboard, mods, 0, 0, 0
+		);
+	}
+
 	zwp_virtual_keyboard_v1_key(
-		wvnc->wl.keyboard, 0, wvnc->keymap.map[keysym].keycode,
+		wvnc->wl.keyboard, 0, keymap_get_keycode(&wvnc->keymap, keysym),
 		down ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED
 	);
 	wl_display_dispatch_pending(wvnc->wl.display);

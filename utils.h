@@ -27,3 +27,6 @@ int shm_create();
     ({ __typeof__ (a) _a = (a); \
        __typeof__ (b) _b = (b); \
        _a < _b ? _a : _b; })
+
+
+#define BIT(n) (1 << (n))
