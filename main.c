@@ -13,6 +13,7 @@
 #include <threads.h>
 #include <unistd.h>
 #include <wayland-client.h>
+#include <xkbcommon/xkbcommon.h>
 
 #include <rfb/rfb.h>
 
@@ -20,7 +21,6 @@
 #include "wayland-wlr-screencopy-client-protocol.h"
 #include "wayland-xdg-output-client-protocol.h"
 
-#include "keymap.h"
 #include "uinput.h"
 #include "utils.h"
 
@@ -63,6 +63,13 @@ struct wvnc_args {
 };
 
 
+struct wvnc_xkb {
+	struct xkb_context *ctx;
+	struct xkb_keymap *map;
+	struct xkb_state *state;
+};
+
+
 struct wvnc {
 	struct {
 		rfbScreenInfo *screen_info;
@@ -80,12 +87,11 @@ struct wvnc {
 		struct zwp_virtual_keyboard_v1 *keyboard;
 	} wl;
 
+	struct wvnc_xkb xkb;
+
 	struct wvnc_args args;
 
 	struct wvnc_uinput uinput;
-
-	struct keymap keymap;
-	unsigned int mod_counters[KEYMAP_MOD_MAX + 1];
 
 	struct wvnc_buffer buffer;
 
@@ -370,19 +376,6 @@ rgba_t *get_transformed_fb_ptr(rgba_t *fb, enum wl_output_transform transform,
 }
 
 
-static void update_virtual_keyboard(struct wvnc *wvnc)
-{
-	int fd = shm_create();
-	FILE *f = fdopen(fd, "w");
-	keymap_print_to_file(&wvnc->keymap, f);
-	size_t size = ftell(f);
-
-	zwp_virtual_keyboard_v1_keymap(wvnc->wl.keyboard, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd, size);
-	wl_display_dispatch_pending(wvnc->wl.display);
-	fclose(f);
-}
-
-
 static enum rfbNewClientAction rfb_new_client_hook(rfbClientPtr cl)
 {
 	cl->clientData = global_wvnc;
@@ -420,53 +413,86 @@ static void rfb_ptr_hook(int mask, int screen_x, int screen_y, rfbClientPtr cl)
 }
 
 
+struct key_iter_search {
+	xkb_keysym_t keysym;
+
+	xkb_keycode_t keycode;
+	xkb_level_index_t level;
+};
+
+	
+static void key_iter(struct xkb_keymap *xkb, xkb_keycode_t key, void *data) {
+	struct key_iter_search *search = data;
+	if (search->keycode != XKB_KEYCODE_INVALID) {
+		return;  // We are done
+	}
+	xkb_level_index_t num_levels = xkb_keymap_num_levels_for_key(xkb, key, 0);
+	for (xkb_level_index_t i = 0; i < num_levels; i++) {
+		const xkb_keysym_t *syms;
+		int num_syms = xkb_keymap_key_get_syms_by_level(xkb, key, 0, i, &syms);
+		for (int k = 0; k < num_syms; k++) {
+			if (syms[k] == search->keysym) {
+				search->keycode = key;
+				search->level = i;
+				break;
+				goto end;
+			}
+		}
+	}
+end:
+	return;
+}
+
 static void rfb_key_hook(rfbBool down, rfbKeySym keysym, rfbClientPtr cl)
 {
 	struct wvnc *wvnc = cl->clientData;
+	struct wvnc_xkb *xkb = &wvnc->xkb;
 	if (wvnc->wl.keyboard == NULL) {
 		return;
 	}
 
-	enum keymap_push_result result = keymap_push_keysym(&wvnc->keymap, keysym);
-	if (result == KEYMAP_PUSH_NOT_FOUND) {
-		log_error("Unknown keysym %04x", keysym);
+	struct key_iter_search search = {
+		.keysym = keysym,
+		.keycode = XKB_KEYCODE_INVALID,
+		.level = 0,
+	};
+	xkb_keymap_key_for_each(xkb->map, key_iter, &search);
+	if (search.keycode == XKB_KEYCODE_INVALID) {
+		log_error("Keysym %04x not found in our keymap", keysym);
 		return;
 	}
 
-	if (result == KEYMAP_PUSH_ADDED) {
-		log_info("Updating virtual keymap");
-		update_virtual_keyboard(wvnc);
-	}
-
-	enum keymap_mod mod = keymap_get_modifier(&wvnc->keymap, keysym);
-	if (mod != KEYMAP_MOD_NONE) {
-		if (down) {
-			wvnc->mod_counters[mod]++;
-		} else if (wvnc->mod_counters[mod] > 0){
-			wvnc->mod_counters[mod]--;
-		} else {
-			log_error("Modifier %d released without being pressed first!", mod);
-		}
-
-		uint32_t mods = 0;
-		for (size_t i = 0; i < ARRAY_SIZE(wvnc->mod_counters); i++) {
-			if (wvnc->mod_counters[i] > 0) {
-				mods |= BIT(i);
-			}
-		}
-
-		log_info("Sending mod mask %02x", mods);
-
-		zwp_virtual_keyboard_v1_modifiers(
-			wvnc->wl.keyboard, mods, 0, 0, 0
-		);
-	}
-
 	zwp_virtual_keyboard_v1_key(
-		wvnc->wl.keyboard, 0, keymap_get_keycode(&wvnc->keymap, keysym),
+		wvnc->wl.keyboard, 0,
+		search.keycode - xkb_keymap_min_keycode(xkb->map) + 1,
 		down ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED
 	);
 	wl_display_dispatch_pending(wvnc->wl.display);
+
+	enum xkb_state_component component =
+		xkb_state_update_key(xkb->state, search.keycode,
+							 down ? XKB_KEY_DOWN : XKB_KEY_UP);
+
+	if (component & (XKB_STATE_MODS_DEPRESSED | XKB_STATE_MODS_LATCHED |
+					 XKB_STATE_MODS_LOCKED | XKB_STATE_MODS_EFFECTIVE)) {
+		// Modifiers changed, we have to propagate them to the compositor
+		xkb_mod_mask_t depressed = xkb_state_serialize_mods(
+			xkb->state, XKB_STATE_MODS_DEPRESSED
+		);
+		xkb_mod_mask_t latched = xkb_state_serialize_mods(
+			xkb->state, XKB_STATE_MODS_LATCHED
+		);
+		xkb_mod_mask_t locked = xkb_state_serialize_mods(
+			xkb->state, XKB_STATE_MODS_LOCKED
+		);
+		xkb_mod_mask_t group = xkb_state_serialize_mods(
+			xkb->state, XKB_STATE_MODS_EFFECTIVE
+		);
+
+		zwp_virtual_keyboard_v1_modifiers(
+			wvnc->wl.keyboard, depressed, latched, locked, group
+		);
+	}
 }
 
 
@@ -554,12 +580,45 @@ static void init_virtual_keyboard(struct wvnc *wvnc)
 		log_error("Unable to create a virtual keyboard");
 		return;
 	}
+
 	wvnc->wl.keyboard = zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(
 		wvnc->wl.keyboard_manager, wvnc->wl.seat
 	);
 
-	keymap_init(&wvnc->keymap);
-	update_virtual_keyboard(wvnc);
+	// Now we create all the XKB context
+	struct wvnc_xkb *xkb = &wvnc->xkb;
+	xkb->ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+	if (xkb->ctx == NULL) {
+		fail("Failed to create XKB context");
+	}
+	// TODO: Get this from wl_keyboard instead?
+	struct xkb_rule_names names = {
+		.rules = "",
+		.model = "",
+		.layout = "us",
+		.variant = "",
+		.options = ""
+	};
+	xkb->map = xkb_keymap_new_from_names(xkb->ctx, &names, 0);
+	if (xkb->map == NULL) {
+		fail("Failed to load keymap");
+	}
+	xkb->state = xkb_state_new(xkb->map);
+	if (xkb->state == NULL) {
+		fail("Failed to create XKB state");
+	}
+
+	int fd = shm_create();
+	char *str = xkb_keymap_get_as_string(xkb->map, XKB_KEYMAP_USE_ORIGINAL_FORMAT);
+	ssize_t length = strlen(str) + 1;
+	ssize_t ret = write(fd, str, length);
+	if (ret != length) {
+		fail("Failed to send keymap to the virtual keyboard");
+	}
+
+	zwp_virtual_keyboard_v1_keymap(wvnc->wl.keyboard, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd, length);
+	wl_display_dispatch_pending(wvnc->wl.display);
+	log_info("Uploaded keymap to the virtual keyboard");
 }
 
 
