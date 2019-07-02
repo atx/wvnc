@@ -1,8 +1,8 @@
 
 #pragma once
 
-#include <stdlib.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 __attribute__((noreturn))
 void fail(const char *format, ...);
@@ -14,6 +14,7 @@ void *xmalloc(size_t size);
 
 uint64_t time_monotonic();
 
+int shm_create();
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
 

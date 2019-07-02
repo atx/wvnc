@@ -1,22 +1,23 @@
 
-#include <assert.h>
-#include <arpa/inet.h>
 #include <argp.h>
+#include <arpa/inet.h>
+#include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <wayland-client.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <fcntl.h>
 #include <threads.h>
+#include <unistd.h>
+#include <wayland-client.h>
 
 #include <rfb/rfb.h>
 
-#include "wayland-xdg-output-client-protocol.h"
-#include "wayland-wlr-screencopy-client-protocol.h"
 #include "wayland-virtual-keyboard-client-protocol.h"
+#include "wayland-wlr-screencopy-client-protocol.h"
+#include "wayland-xdg-output-client-protocol.h"
 
 #include "keymap.h"
 #include "utils.h"
@@ -80,7 +81,7 @@ struct wvnc {
 
 	struct keymap keymap;
 
-	struct wvnc_buffer buffers[16];
+	struct wvnc_buffer buffer;
 
 	struct wl_list outputs;
 	struct wvnc_output *selected_output;
@@ -105,33 +106,12 @@ struct wvnc_output {
 thread_local struct wvnc *global_wvnc;
 
 
-static int open_shm_fd()
-{
-	const char *filename_format = "/wvnc-%d";
-	char filename[sizeof(filename_format) + 10];
-	int fd = -1;
-	for (int i = 0; i < 10000; i++) {
-		snprintf(filename, sizeof(filename), filename_format, i);
-		fd = shm_open(filename, O_RDWR | O_EXCL | O_CREAT | O_TRUNC, 0660);
-		if (fd >= 0) {
-			// Just the fd matters now
-			shm_unlink(filename);
-			break;
-		}
-	}
-	if (fd < 0) {
-		fail("Failed to open SHM file");
-	}
-	return fd;
-}
-
-
 static void initialize_shm_buffer(struct wvnc_buffer *buffer,
 								  enum wl_shm_format format,
 								  uint32_t width, uint32_t height,
 								  uint32_t stride)
 {
-	int fd = open_shm_fd();
+	int fd = shm_create();
 	size_t size = stride * height;
 	int ret = ftruncate(fd, size);
 	if (ret < 0) {
@@ -378,7 +358,7 @@ rgba_t *get_transformed_fb_ptr(rgba_t *fb, enum wl_output_transform transform,
 
 static void update_virtual_keyboard(struct wvnc *wvnc)
 {
-	int fd = open_shm_fd();
+	int fd = shm_create();
 	FILE *f = fdopen(fd, "w");
 	keymap_print_to_file(&wvnc->keymap, f);
 	size_t size = ftell(f);
@@ -503,9 +483,7 @@ static void init_wayland(struct wvnc *wvnc)
 		fail("Failed to connect to the Wayland display");
 	}
 	wl_list_init(&wvnc->outputs);
-	for (size_t i = 0; i < ARRAY_SIZE(wvnc->buffers); i++) {
-		wvnc->buffers[i].wvnc = wvnc;
-	}
+	wvnc->buffer.wvnc = wvnc;
 	wvnc->wl.registry = wl_display_get_registry(wvnc->wl.display);
 	wl_registry_add_listener(wvnc->wl.registry, &registry_listener, wvnc);
 	wl_display_dispatch(wvnc->wl.display);
@@ -551,6 +529,7 @@ static void init_rfb(struct wvnc *wvnc)
 	wvnc->rfb.screen_info->screenData = wvnc;
 	wvnc->rfb.screen_info->newClientHook = rfb_new_client_hook;
 	wvnc->rfb.screen_info->kbdAddEvent = rfb_key_hook;
+	wvnc->rfb.screen_info->ptrAddEvent = rfb_ptr_hook;
 	// TODO: Set rfbLog/rfbErr
 
 	size_t fb_size = wvnc->selected_output->width * wvnc->selected_output->height * sizeof(rgba_t);
@@ -652,7 +631,7 @@ int main(int argc, char *argv[])
 	struct zwlr_screencopy_frame_v1 *frame = NULL;
 	bool capturing = false;
 	while (true) {
-		struct wvnc_buffer *buffer = &wvnc->buffers[0];
+		struct wvnc_buffer *buffer = &wvnc->buffer;
 		// TODO: Should we composite the cursor or not?
 		uint64_t t_now = time_monotonic();
 		uint64_t t_delta = t_now - last_capture;

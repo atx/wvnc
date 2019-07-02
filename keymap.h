@@ -1,9 +1,10 @@
 
 #pragma once
+
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
-#include <stdbool.h>
 
 // Mapping between VNC keycodes and our keymap
 // As everything sucks, we have to do it this way instead of just passing
