@@ -80,7 +80,6 @@ struct wvnc {
 		struct wl_display *display;
 		struct wl_registry *registry;
 		struct wl_shm *shm;
-		struct wl_seat *seat;
 		struct zxdg_output_manager_v1 *output_manager;
 		struct zwlr_screencopy_manager_v1 *screencopy_manager;
 		struct zwp_virtual_keyboard_manager_v1 *keyboard_manager;
@@ -94,6 +93,8 @@ struct wvnc {
 
 	struct wl_list outputs;
 	struct wvnc_output *selected_output;
+	struct wl_list seats;
+	struct wvnc_seat *selected_seat;
 
 	uint32_t logical_width;
 	uint32_t logical_height;
@@ -112,6 +113,15 @@ struct wvnc_output {
 	enum wl_output_transform transform;
 
 	const char *name;
+};
+
+
+struct wvnc_seat {
+	struct wl_seat *wl;
+	const char *name;
+	uint32_t capabilities;
+
+	struct wl_list link;
 };
 
 
@@ -292,6 +302,29 @@ static const struct zxdg_output_v1_listener xdg_output_listener = {
 };
 
 
+static void handle_seat_capabilities(void *data, struct wl_seat *wl_seat,
+									 uint32_t capabilities)
+{
+	struct wvnc_seat *seat = data;
+	seat->capabilities = capabilities;
+}
+
+
+static void handle_seat_name(void *data, struct wl_seat *wl_seat,
+							 const char *name)
+{
+	struct wvnc_seat *seat = data;
+	seat->name = strdup(name);
+	log_info("Name = %s", seat->name);
+}
+
+
+static const struct wl_seat_listener wl_seat_listener = {
+	.capabilities = handle_seat_capabilities,
+	.name = handle_seat_name,
+};
+
+
 static void handle_wl_registry_global(void *data, struct wl_registry *registry,
 									  uint32_t name, const char *interface,
 									  uint32_t version)
@@ -311,7 +344,14 @@ static void handle_wl_registry_global(void *data, struct wl_registry *registry,
 	} else if (IS_PROTOCOL(wl_shm)) {
 		wvnc->wl.shm = BIND(wl_shm, 1);
 	} else if (IS_PROTOCOL(wl_seat)) {
-		wvnc->wl.seat = BIND(wl_seat, 7);
+		// This is the seat we bind our virtual keyboard to
+		// sway currently does not support binding somewhere else than seat0,
+		// so we don't support choosing here either.
+		// TODO: Patch sway and fix this
+		struct wvnc_seat *seat = xmalloc(sizeof(struct wvnc_seat));
+		seat->wl = BIND(wl_seat, 7);
+		wl_seat_add_listener(seat->wl, &wl_seat_listener, seat);
+		wl_list_insert(&wvnc->seats, &seat->link);
 	} else if (IS_PROTOCOL(zwp_virtual_keyboard_manager_v1)) {
 		wvnc->wl.keyboard_manager = BIND(zwp_virtual_keyboard_manager_v1, 1);
 	}
@@ -568,35 +608,105 @@ static void calculate_logical_size(struct wvnc *wvnc)
 }
 
 
-static void init_virtual_keyboard(struct wvnc *wvnc)
+static void handle_keyboard_keymap(void *data, struct wl_keyboard *wl,
+								   uint32_t format, int32_t fd, uint32_t size)
 {
-	if (wvnc->wl.keyboard_manager == NULL || wvnc->wl.seat == NULL) {
-		log_error("Unable to create a virtual keyboard");
-		return;
+	struct wvnc *wvnc = data;
+	if (wvnc->xkb.map != NULL) {
+		return; // We already have a keymap from somewhere
 	}
 
-	wvnc->wl.keyboard = zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(
-		wvnc->wl.keyboard_manager, wvnc->wl.seat
-	);
+	void *mem = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+	if (mem == MAP_FAILED) {
+		return;
+	}
+	wvnc->xkb.map = xkb_keymap_new_from_string(wvnc->xkb.ctx, mem,
+		XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+}
 
+
+static void handle_keyboard_enter(void *data, struct wl_keyboard *wl,
+								  uint32_t serial, struct wl_surface *wls,
+								  struct wl_array *keys)
+{
+}
+
+
+static void handle_keyboard_leave(void *data, struct wl_keyboard *wl,
+								  uint32_t serial, struct wl_surface *wls)
+{
+}
+
+
+static void handle_keyboard_key(void *data, struct wl_keyboard *wl,
+								uint32_t serial, uint32_t time, uint32_t key,
+								uint32_t state)
+{
+}
+
+
+static void handle_keyboard_modifiers(void *data, struct wl_keyboard *wl,
+									  uint32_t serial, uint32_t mods_depressed,
+									  uint32_t mods_latched, uint32_t mods_locked,
+									  uint32_t group)
+{
+}
+
+
+static void handle_keyboard_repeat_info(void *data, struct wl_keyboard *wl,
+										int32_t rate, int32_t delay)
+{
+}
+
+
+static const struct wl_keyboard_listener wl_keyboard_listener = {
+	.keymap = handle_keyboard_keymap,
+	.enter = handle_keyboard_enter,
+	.leave = handle_keyboard_leave,
+	.key = handle_keyboard_key,
+	.modifiers = handle_keyboard_modifiers,
+	.repeat_info = handle_keyboard_repeat_info,
+};
+
+
+static void init_virtual_keyboard(struct wvnc *wvnc)
+{
 	// Now we create all the XKB context
 	struct wvnc_xkb *xkb = &wvnc->xkb;
 	xkb->ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 	if (xkb->ctx == NULL) {
 		fail("Failed to create XKB context");
 	}
-	// TODO: Get this from wl_keyboard instead?
-	struct xkb_rule_names names = {
-		.rules = "",
-		.model = "",
-		.layout = "us",
-		.variant = "",
-		.options = ""
-	};
-	xkb->map = xkb_keymap_new_from_names(xkb->ctx, &names, 0);
+
+	// We need to get a keymap _somewhere_. This could be either from our
+	// selected seat (preferred) or from libxkb (worse).
+	if (wvnc->selected_seat->capabilities & WL_SEAT_CAPABILITY_KEYBOARD) {
+		struct wl_keyboard *wl_keyboard =
+			wl_seat_get_keyboard(wvnc->selected_seat->wl);
+		wl_keyboard_add_listener(wl_keyboard, &wl_keyboard_listener, wvnc);
+		wl_display_dispatch(wvnc->wl.display);
+		wl_display_roundtrip(wvnc->wl.display);
+	}
+	if (xkb->map == NULL) {
+		// Either getting the keymap from wl_seat failed or it has no keyboard
+		// attached. So we try to get a generic keymap and hope for the best.
+		// TODO: Maybe at least un-hardcode this?
+		struct xkb_rule_names names = {
+			.rules = "",
+			.model = "",
+			.layout = "us",
+			.variant = "",
+			.options = ""
+		};
+		xkb->map = xkb_keymap_new_from_names(xkb->ctx, &names, 0);
+	}
 	if (xkb->map == NULL) {
 		fail("Failed to load keymap");
 	}
+	wvnc->wl.keyboard = zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(
+		wvnc->wl.keyboard_manager, wvnc->selected_seat->wl
+	);
+
 	xkb->state = xkb_state_new(xkb->map);
 	if (xkb->state == NULL) {
 		fail("Failed to create XKB state");
@@ -623,6 +733,7 @@ static void init_wayland(struct wvnc *wvnc)
 		fail("Failed to connect to the Wayland display");
 	}
 	wl_list_init(&wvnc->outputs);
+	wl_list_init(&wvnc->seats);
 	wvnc->buffer.wvnc = wvnc;
 	wvnc->wl.registry = wl_display_get_registry(wvnc->wl.display);
 	wl_registry_add_listener(wvnc->wl.registry, &registry_listener, wvnc);
@@ -634,6 +745,7 @@ static void init_wayland(struct wvnc *wvnc)
 	if (wvnc->wl.output_manager == NULL) {
 		fail("xdg-output-manager protocol not supported");
 	}
+	// Here we load output info
 	struct wvnc_output *output;
 	wl_list_for_each(output, &wvnc->outputs, link) {
 		output->xdg = zxdg_output_manager_v1_get_xdg_output(
@@ -643,9 +755,44 @@ static void init_wayland(struct wvnc *wvnc)
 	}
 	wl_display_dispatch(wvnc->wl.display);
 	wl_display_roundtrip(wvnc->wl.display);
-	init_virtual_keyboard(wvnc);
+	// Now we select our seat for the virtual keyboard
+	struct wvnc_seat *seat;
+	wl_list_for_each(seat, &wvnc->seats, link) {
+		// TODO: Actual seat selection code
+		wvnc->selected_seat = seat;
+		break;
+	}
+
+	if (wvnc->wl.keyboard_manager != NULL && wvnc->selected_seat != NULL) {
+		init_virtual_keyboard(wvnc);
+	} else {
+		log_error("Unable to initialize the virtual keyboard");
+	}
 	calculate_logical_size(wvnc);
 	log_info("Wayland initialized");
+
+	// Find the correct output to use
+	if (wl_list_length(&wvnc->outputs) > 1) {
+		if (wvnc->args.output == NULL) {
+			fail("Multiple outputs specified but none explicitly selected");
+		}
+		struct wvnc_output *out;
+		wl_list_for_each(out, &wvnc->outputs, link) {
+			if (!strcmp(out->name, wvnc->args.output)) {
+				wvnc->selected_output = out;
+				break;
+			}
+		}
+	} else {
+		struct wvnc_output *out;
+		wl_list_for_each(out, &wvnc->outputs, link) {
+			wvnc->selected_output = out;
+			break;
+		}
+	}
+	if (wvnc->selected_output == NULL) {
+		fail("No output found");
+	}
 }
 
 
@@ -753,28 +900,6 @@ int main(int argc, char *argv[])
 		}
 	}
 	init_wayland(wvnc);
-
-	if (wl_list_length(&wvnc->outputs) > 1) {
-		if (wvnc->args.output == NULL) {
-			fail("Multiple outputs specified but none explicitly selected");
-		}
-		struct wvnc_output *out;
-		wl_list_for_each(out, &wvnc->outputs, link) {
-			if (!strcmp(out->name, wvnc->args.output)) {
-				wvnc->selected_output = out;
-				break;
-			}
-		}
-	} else {
-		struct wvnc_output *out;
-		wl_list_for_each(out, &wvnc->outputs, link) {
-			wvnc->selected_output = out;
-			break;
-		}
-	}
-	if (wvnc->selected_output == NULL) {
-		fail("No output found");
-	}
 	// TODO: Handle size and transformations
 	log_info("Starting on output %s with resolution %dx%d",
 			 wvnc->selected_output->name,
