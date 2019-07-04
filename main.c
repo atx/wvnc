@@ -88,11 +88,8 @@ struct wvnc {
 	} wl;
 
 	struct wvnc_xkb xkb;
-
 	struct wvnc_args args;
-
 	struct wvnc_uinput uinput;
-
 	struct wvnc_buffer buffer;
 
 	struct wl_list outputs;
@@ -308,7 +305,6 @@ static void handle_wl_registry_global(void *data, struct wl_registry *registry,
 		wl_output_add_listener(out->wl, &output_listener, out);
 		wl_list_insert(&wvnc->outputs, &out->link);
 	} else if (IS_PROTOCOL(zxdg_output_manager_v1)) {
-		// TODO: Load names
 		wvnc->wl.output_manager = BIND(zxdg_output_manager_v1, 2);
 	} else if (IS_PROTOCOL(zwlr_screencopy_manager_v1)) {
 		wvnc->wl.screencopy_manager = BIND(zwlr_screencopy_manager_v1, 1);
@@ -335,45 +331,6 @@ static const struct wl_registry_listener registry_listener = {
 	.global = handle_wl_registry_global,
 	.global_remove = handle_wl_registry_global_remove,
 };
-
-
-rgba_t *get_transformed_fb_ptr(rgba_t *fb, enum wl_output_transform transform,
-							   uint32_t width, uint32_t height,
-							   uint32_t ox, uint32_t oy)
-{
-	// TODO: This will not get inlined/vectorized well. We should
-	// build multiple versions of copy_to_next_fb with different transforms
-	// baked in
-	uint32_t tx, ty;
-	// TODO: This assumes we have y_flipped!
-	// This should be corrected globally be changing the flag after we get the
-	// first buffer back.
-	switch (transform) {
-	case WL_OUTPUT_TRANSFORM_NORMAL:
-		tx = ox;
-		ty = height - oy - 1;
-		break;
-	case WL_OUTPUT_TRANSFORM_90:
-		tx = width - oy - 1;
-		ty = height - ox - 1;
-		break;
-	case WL_OUTPUT_TRANSFORM_180:
-		tx = ox;
-		ty = oy;
-		break;
-	case WL_OUTPUT_TRANSFORM_270:
-		tx = oy;
-		ty = ox;
-		break;
-	default:
-		assert(false);
-		// Meh, this will break but whatever
-		tx = ox;
-		ty = oy;
-	};
-
-	return &fb[ty * width + tx];
-}
 
 
 static enum rfbNewClientAction rfb_new_client_hook(rfbClientPtr cl)
@@ -496,6 +453,45 @@ static void rfb_key_hook(rfbBool down, rfbKeySym keysym, rfbClientPtr cl)
 }
 
 
+rgba_t *get_transformed_fb_off(rgba_t *fb, enum wl_output_transform transform,
+							   uint32_t width, uint32_t height,
+							   uint32_t ox, uint32_t oy)
+{
+	// TODO: This will not get inlined/vectorized well. We should
+	// build multiple versions of copy_to_next_fb with different transforms
+	// baked in
+	uint32_t tx, ty;
+	// TODO: This assumes we have y_flipped!
+	// This should be corrected globally be changing the flag after we get the
+	// first buffer back.
+	switch (transform) {
+	case WL_OUTPUT_TRANSFORM_NORMAL:
+		tx = ox;
+		ty = height - oy - 1;
+		break;
+	case WL_OUTPUT_TRANSFORM_90:
+		tx = width - oy - 1;
+		ty = height - ox - 1;
+		break;
+	case WL_OUTPUT_TRANSFORM_180:
+		tx = ox;
+		ty = oy;
+		break;
+	case WL_OUTPUT_TRANSFORM_270:
+		tx = oy;
+		ty = ox;
+		break;
+	default:
+		assert(false);
+		// Meh, this will break but whatever
+		tx = ox;
+		ty = oy;
+	};
+
+	return &fb[ty * width + tx];
+}
+
+
 static void copy_to_next_fb(struct wvnc *wvnc, struct wvnc_buffer *buffer)
 {
 	// TODO: Support different formats
@@ -509,7 +505,7 @@ static void copy_to_next_fb(struct wvnc *wvnc, struct wvnc_buffer *buffer)
 				.b = (src >>  0) & 0xff,
 				.a = 0xff,
 			};
-			rgba_t *tgt = get_transformed_fb_ptr(
+			rgba_t *tgt = get_transformed_fb_off(
 				wvnc->rfb.fb_next, wvnc->selected_output->transform,
 				wvnc->selected_output->width, wvnc->selected_output->height,
 				x, y
@@ -562,7 +558,6 @@ static void calculate_logical_size(struct wvnc *wvnc)
 	int32_t max_y = INT32_MIN;
 	struct wvnc_output *output;
 	wl_list_for_each(output, &wvnc->outputs, link) {
-		log_info(output->name);
 		min_x = min(min_x, output->x);
 		max_x = max(max_x, output->x + (int32_t)output->width);
 		min_y = min(min_y, output->y);
@@ -570,7 +565,6 @@ static void calculate_logical_size(struct wvnc *wvnc)
 	}
 	wvnc->logical_width = max_x - min_x;
 	wvnc->logical_height = max_y - min_y;
-	log_info("Boundaries %dx%d %dx%d", min_x, min_y, max_x, max_y);
 }
 
 
@@ -651,7 +645,7 @@ static void init_wayland(struct wvnc *wvnc)
 	wl_display_roundtrip(wvnc->wl.display);
 	init_virtual_keyboard(wvnc);
 	calculate_logical_size(wvnc);
-	log_info("Wayland initialized with %d outputs", wl_list_length(&wvnc->outputs));
+	log_info("Wayland initialized");
 }
 
 
