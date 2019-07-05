@@ -21,37 +21,10 @@
 #include "wayland-wlr-screencopy-client-protocol.h"
 #include "wayland-xdg-output-client-protocol.h"
 
+#include "wvnc.h"
+#include "buffer.h"
 #include "uinput.h"
 #include "utils.h"
-
-
-struct wvnc;
-struct wvnc_output;
-
-struct rgba {
-	uint8_t r;
-	uint8_t g;
-	uint8_t b;
-	uint8_t a;
-} __attribute__((packed));
-typedef struct rgba rgba_t;
-static_assert(sizeof(struct rgba) == 4, "Invalid size of struct rgba");
-
-
-struct wvnc_buffer {
-	struct wvnc *wvnc;
-
-	struct wl_buffer *wl;
-	void *data;
-	uint32_t width;
-	uint32_t height;
-	uint32_t stride;
-	size_t size;
-	enum wl_shm_format format;
-	bool y_invert;
-
-	bool done;
-};
 
 
 struct wvnc_args {
@@ -98,30 +71,6 @@ struct wvnc {
 
 	uint32_t logical_width;
 	uint32_t logical_height;
-};
-
-
-struct wvnc_output {
-	struct wl_output *wl;
-	struct zxdg_output_v1 *xdg;
-	struct wl_list link;
-
-	int32_t x;
-	int32_t y;
-	uint32_t width;
-	uint32_t height;
-	enum wl_output_transform transform;
-
-	const char *name;
-};
-
-
-struct wvnc_seat {
-	struct wl_seat *wl;
-	const char *name;
-	uint32_t capabilities;
-
-	struct wl_list link;
 };
 
 
@@ -489,69 +438,6 @@ static void rfb_key_hook(rfbBool down, rfbKeySym keysym, rfbClientPtr cl)
 		zwp_virtual_keyboard_v1_modifiers(
 			wvnc->wl.keyboard, depressed, latched, locked, group
 		);
-	}
-}
-
-
-rgba_t *get_transformed_fb_off(rgba_t *fb, enum wl_output_transform transform,
-							   uint32_t width, uint32_t height,
-							   uint32_t ox, uint32_t oy)
-{
-	// TODO: This will not get inlined/vectorized well. We should
-	// build multiple versions of copy_to_next_fb with different transforms
-	// baked in
-	uint32_t tx, ty;
-	// TODO: This assumes we have y_flipped!
-	// This should be corrected globally be changing the flag after we get the
-	// first buffer back.
-	switch (transform) {
-	case WL_OUTPUT_TRANSFORM_NORMAL:
-		tx = ox;
-		ty = height - oy - 1;
-		break;
-	case WL_OUTPUT_TRANSFORM_90:
-		tx = width - oy - 1;
-		ty = height - ox - 1;
-		break;
-	case WL_OUTPUT_TRANSFORM_180:
-		tx = ox;
-		ty = oy;
-		break;
-	case WL_OUTPUT_TRANSFORM_270:
-		tx = oy;
-		ty = ox;
-		break;
-	default:
-		assert(false);
-		// Meh, this will break but whatever
-		tx = ox;
-		ty = oy;
-	};
-
-	return &fb[ty * width + tx];
-}
-
-
-static void copy_to_next_fb(struct wvnc *wvnc, struct wvnc_buffer *buffer)
-{
-	// TODO: Support different formats
-	assert(buffer->format == WL_SHM_FORMAT_ARGB8888 || buffer->format == WL_SHM_FORMAT_XRGB8888);
-	for (uint32_t y = 0; y < buffer->height; y++) {
-		for (uint32_t x = 0; x < buffer->width; x++) {
-			uint32_t src = *(uint32_t *)(buffer->data + y * buffer->stride + x * 4);
-			rgba_t c = {
-				.r = (src >> 16) & 0xff,
-				.g = (src >>  8) & 0xff,
-				.b = (src >>  0) & 0xff,
-				.a = 0xff,
-			};
-			rgba_t *tgt = get_transformed_fb_off(
-				wvnc->rfb.fb_next, wvnc->selected_output->transform,
-				wvnc->selected_output->width, wvnc->selected_output->height,
-				x, y
-			);
-			*tgt = c;
-		}
 	}
 }
 
@@ -931,7 +817,7 @@ int main(int argc, char *argv[])
 		} else if (capturing && buffer->done) {
 			capturing = false;
 
-			copy_to_next_fb(wvnc, buffer);
+			buffer_to_fb(wvnc->rfb.fb_next, wvnc->selected_output, buffer);
 			update_framebuffer(wvnc);
 
 			zwlr_screencopy_frame_v1_destroy(frame);

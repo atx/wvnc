@@ -43,7 +43,7 @@ include_directories ("${CMAKE_BINARY_DIR}")
 include_directories (${LIBVNCSERVER_INCLUDEDIR})
 include_directories (${XKBCOMMON_INCLUDEDIR})
 
-add_executable (wvnc main.c utils.c uinput.c ${VIRTUAL_KEYBOARD_SRC}
+add_executable (wvnc main.c buffer.c utils.c uinput.c ${VIRTUAL_KEYBOARD_SRC}
 	${WLR_SCREENCOPY_SRC} ${XDG_OUTPUT_SRC})
 target_link_libraries (wvnc rt m ${Wayland_LIBRARIES} ${LIBVNCSERVER_LIBRARIES}
 	${XKBCOMMON_LIBRARIES})
