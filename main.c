@@ -444,33 +444,44 @@ static void rfb_key_hook(rfbBool down, rfbKeySym keysym, rfbClientPtr cl)
 
 static void update_framebuffer(struct wvnc *wvnc)
 {
-	// TODO: Maybe get something more sophisticated here?
-	uint64_t scanline_damage_map[wvnc->selected_output->height / 64 + 1];
-	memset(scanline_damage_map, 0, sizeof(scanline_damage_map));
+	const unsigned int tile_pixels = 32;
+	const unsigned int bitmap_bits = 64;
+	unsigned int tile_count_x = wvnc->selected_output->width / tile_pixels;
+	if (wvnc->selected_output->width % bitmap_bits != 0) {
+		tile_count_x++;
+	}
+	unsigned int tile_count_y = wvnc->selected_output->height / tile_pixels + 1;
+	if (wvnc->selected_output->height % bitmap_bits != 0) {
+		tile_count_y++;
+	}
+	uint64_t bits[(tile_count_x * tile_count_y) / bitmap_bits + 1];
+	memset(bits, 0, sizeof(bits));
 
 	for (uint32_t y = 0; y < wvnc->selected_output->height; y++) {
-		bool damaged = false;
 		for (uint32_t x = 0; x < wvnc->selected_output->width; x++) {
 			size_t off = y*wvnc->selected_output->width + x;
 			rgba_t src = wvnc->rfb.fb_next[off];
 			rgba_t *tgt = &wvnc->rfb.fb[off];
 			if (src.r != tgt->r || src.g != tgt->g || src.b != tgt->b || src.a != tgt->a) {
-				*tgt = src;
-				damaged = true;
+				unsigned int tile_x = x / tile_pixels;
+				unsigned int tile_y = y / tile_pixels;
+				unsigned int tile_off = tile_y * tile_count_x + tile_x;
+				bits[tile_off / bitmap_bits] |= BIT(tile_off % bitmap_bits);
 			}
-		}
-		if (damaged) {
-			scanline_damage_map[y / 64] |= 1 << (y % 64);
+			*tgt = src;
 		}
 	}
 
-	for (uint32_t y = 0; y < wvnc->selected_output->height; y++) {
-		uint64_t bits = scanline_damage_map[y / 64];
-		if (bits & (1 << (y % 64))) {
-			rfbMarkRectAsModified(
+	for (unsigned int tile_y = 0; tile_y < tile_count_y; tile_y++) {
+		for (unsigned int tile_x = 0; tile_x < tile_count_x; tile_x++) {
+			unsigned int tile_off = tile_y * tile_count_x + tile_x;
+			if (bits[tile_off / 64] & BIT(tile_off % 64)) {
+				rfbMarkRectAsModified(
 					wvnc->rfb.screen_info,
-					0, y, wvnc->selected_output->width, y + 1
-			);
+					tile_x*tile_pixels, tile_y*tile_pixels,
+					(tile_x+1)*tile_pixels, (tile_y+1)*tile_pixels
+				);
+			}
 		}
 	}
 }
