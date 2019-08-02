@@ -1,7 +1,8 @@
-cmake_minimum_required (VERSION 3.6)
+cmake_minimum_required (VERSION 3.9)
 project (wvnc)
 
 set (CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set (CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
 
 find_package(ECM REQUIRED NO_MODULE)
 set(CMAKE_MODULE_PATH ${ECM_MODULE_PATH})
