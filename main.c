@@ -47,7 +47,6 @@ struct wvnc {
 	struct {
 		rfbScreenInfo *screen_info;
 		rgba_t *fb;
-		rgba_t *fb_next;
 	} rfb;
 	struct {
 		struct wl_display *display;
@@ -62,7 +61,8 @@ struct wvnc {
 	struct wvnc_xkb xkb;
 	struct wvnc_args args;
 	struct wvnc_uinput uinput;
-	struct wvnc_buffer buffer;
+	struct wvnc_buffer buffers[2];
+	unsigned int buffer_i;
 
 	struct wl_list outputs;
 	struct wvnc_output *selected_output;
@@ -442,46 +442,81 @@ static void rfb_key_hook(rfbBool down, rfbKeySym keysym, rfbClientPtr cl)
 }
 
 
-static void update_framebuffer(struct wvnc *wvnc)
+static void update_framebuffer_full(struct wvnc *wvnc, struct wvnc_buffer *new)
 {
+	buffer_to_fb(wvnc->rfb.fb, wvnc->selected_output, new,
+				 0, 0, new->width, new->height);
+	rfbMarkRectAsModified(
+		wvnc->rfb.screen_info,
+		0, 0, wvnc->selected_output->width, wvnc->selected_output->height
+	);
+}
+
+
+static void update_framebuffer(struct wvnc *wvnc,
+							   struct wvnc_buffer *old, struct wvnc_buffer *new)
+{
+	assert(new->width == old->width && new->height == old->height &&
+		   new->stride == old->stride);
 	const unsigned int tile_pixels = 32;
 	const unsigned int bitmap_bits = 64;
-	unsigned int tile_count_x = wvnc->selected_output->width / tile_pixels;
-	if (wvnc->selected_output->width % bitmap_bits != 0) {
+	unsigned int tile_count_x = new->width / tile_pixels;
+	if (new->width % bitmap_bits != 0) {
 		tile_count_x++;
 	}
-	unsigned int tile_count_y = wvnc->selected_output->height / tile_pixels + 1;
-	if (wvnc->selected_output->height % bitmap_bits != 0) {
+	unsigned int tile_count_y = new->height / tile_pixels;
+	if (new->height % bitmap_bits != 0) {
 		tile_count_y++;
 	}
 	uint64_t bits[(tile_count_x * tile_count_y) / bitmap_bits + 1];
 	memset(bits, 0, sizeof(bits));
 
-	for (uint32_t y = 0; y < wvnc->selected_output->height; y++) {
-		for (uint32_t x = 0; x < wvnc->selected_output->width; x++) {
-			size_t off = y*wvnc->selected_output->width + x;
-			rgba_t src = wvnc->rfb.fb_next[off];
-			rgba_t *tgt = &wvnc->rfb.fb[off];
-			if (src.r != tgt->r || src.g != tgt->g || src.b != tgt->b || src.a != tgt->a) {
+	for (uint32_t y = 0; y < new->height; y++) {
+		for (uint32_t x = 0; x < new->width; x++) {
+			uint32_t offset = y*new->stride + x * 4;  // Assuming 4 bytes per pixel
+			uint32_t src = *(uint32_t *)(new->data + offset);
+			uint32_t tgt = *(uint32_t *)(old->data + offset);
+			if (src != tgt) {
 				unsigned int tile_x = x / tile_pixels;
 				unsigned int tile_y = y / tile_pixels;
-				unsigned int tile_off = tile_y * tile_count_x + tile_x;
+				unsigned int tile_off = tile_y*tile_count_x + tile_x;
 				bits[tile_off / bitmap_bits] |= BIT(tile_off % bitmap_bits);
 			}
-			*tgt = src;
 		}
 	}
 
 	for (unsigned int tile_y = 0; tile_y < tile_count_y; tile_y++) {
 		for (unsigned int tile_x = 0; tile_x < tile_count_x; tile_x++) {
-			unsigned int tile_off = tile_y * tile_count_x + tile_x;
-			if (bits[tile_off / 64] & BIT(tile_off % 64)) {
-				rfbMarkRectAsModified(
-					wvnc->rfb.screen_info,
-					tile_x*tile_pixels, tile_y*tile_pixels,
-					(tile_x+1)*tile_pixels, (tile_y+1)*tile_pixels
-				);
+			unsigned int tile_off = tile_y*tile_count_x + tile_x;
+			if (!(bits[tile_off / bitmap_bits] & BIT(tile_off % bitmap_bits))) {
+				continue;
 			}
+			// We have a modified tile, copy data over to the VNC
+			// framebufer and mark it as modified
+			uint32_t x = tile_x*tile_pixels;
+			uint32_t y = tile_y*tile_pixels;
+			uint32_t w = min(tile_pixels, new->width - x);
+			uint32_t h = min(tile_pixels, new->height - y);
+			buffer_to_fb(
+				wvnc->rfb.fb, wvnc->selected_output, new,
+				x, y, w, h
+			);
+
+			uint32_t fb_x_start;
+			uint32_t fb_y_start;
+			buffer_calculate_fb_coords(
+				wvnc->selected_output, x, y, &fb_x_start, &fb_y_start
+			);
+			uint32_t fb_x_end;
+			uint32_t fb_y_end;
+			buffer_calculate_fb_coords(
+				wvnc->selected_output, x + w, y + h, &fb_x_end, &fb_y_end
+			);
+
+			rfbMarkRectAsModified(
+				wvnc->rfb.screen_info,
+				fb_x_start, fb_y_start, fb_x_end, fb_y_end
+			);
 		}
 	}
 }
@@ -631,7 +666,9 @@ static void init_wayland(struct wvnc *wvnc)
 	}
 	wl_list_init(&wvnc->outputs);
 	wl_list_init(&wvnc->seats);
-	wvnc->buffer.wvnc = wvnc;
+	for (size_t i = 0; i < ARRAY_SIZE(wvnc->buffers); i++) {
+		wvnc->buffers[i].wvnc = wvnc;
+	}
 	wvnc->wl.registry = wl_display_get_registry(wvnc->wl.display);
 	wl_registry_add_listener(wvnc->wl.registry, &registry_listener, wvnc);
 	wl_display_dispatch(wvnc->wl.display);
@@ -719,7 +756,6 @@ static void init_rfb(struct wvnc *wvnc)
 
 	size_t fb_size = wvnc->selected_output->width * wvnc->selected_output->height * sizeof(rgba_t);
 	wvnc->rfb.fb = xmalloc(fb_size);
-	wvnc->rfb.fb_next = xmalloc(fb_size);
 	wvnc->rfb.screen_info->frameBuffer = (char *)wvnc->rfb.fb;
 
 	log_info("Starting the VNC server");
@@ -810,26 +846,34 @@ int main(int argc, char *argv[])
 	const uint64_t capture_period = wvnc->args.period * 1000;
 	struct zwlr_screencopy_frame_v1 *frame = NULL;
 	bool capturing = false;
+	struct wvnc_buffer *buffer_old = NULL;
+	struct wvnc_buffer *buffer_new = NULL;
 	while (true) {
-		struct wvnc_buffer *buffer = &wvnc->buffer;
 		// TODO: Should we composite the cursor or not?
 		uint64_t t_now = time_monotonic();
 		uint64_t t_delta = t_now - last_capture;
 		if (t_delta >= capture_period && !capturing) {
+			buffer_old = buffer_new;
+			wvnc->buffer_i = (wvnc->buffer_i + 1) % ARRAY_SIZE(wvnc->buffers);
+			buffer_new = &wvnc->buffers[wvnc->buffer_i];
 			last_capture = t_now;
 			capturing = true;
-			buffer->done = false;
+			buffer_new->done = false;
 			frame = zwlr_screencopy_manager_v1_capture_output(
 				wvnc->wl.screencopy_manager, 0, wvnc->selected_output->wl
 			);
-			zwlr_screencopy_frame_v1_add_listener(frame, &frame_listener, buffer);
+			zwlr_screencopy_frame_v1_add_listener(frame, &frame_listener, buffer_new);
 			wl_display_dispatch(wvnc->wl.display);
 			wl_display_flush(wvnc->wl.display);
-		} else if (capturing && buffer->done) {
+		} else if (capturing && buffer_new->done) {
 			capturing = false;
 
-			buffer_to_fb(wvnc->rfb.fb_next, wvnc->selected_output, buffer);
-			update_framebuffer(wvnc);
+			if (buffer_old == NULL) {
+				// Happens only on the first frame we get
+				update_framebuffer_full(wvnc, buffer_new);
+			} else {
+				update_framebuffer(wvnc, buffer_old, buffer_new);
+			}
 
 			zwlr_screencopy_frame_v1_destroy(frame);
 		}
