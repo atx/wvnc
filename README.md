@@ -1,4 +1,7 @@
 # wvnc
+
+#### Note: This project has been superseeded by [wayvnc](https://github.com/any1/wayvnc).
+
 Attach VNC server to a running Wayland compositor. At this point, this is pretty much a proof of concept
 and as such is buggy, does not handle edge cases well and is extremely inefficient etc. You have been warned.
 
